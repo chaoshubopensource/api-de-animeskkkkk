@@ -1,25 +1,21 @@
 """
-proxx.py v2 — proxy de streaming pro CDN PX (pixel-sus) com bypass Cloudflare.
+proxx.py v4 — proxy de streaming pro CDN PX (pixel-sus) com bypass Cloudflare.
 
-v2: integração com FlareSolverr — browser de verdade que resolve o desafio
-("Um momento...") e entrega o cookie cf_clearance pro proxy usar no stream.
+v4: cloudscraper no /px (fingerprint TLS de Chrome) + Referer sushianimes como
+    padrão (confirmado empiricamente: residencial + esse referer = 200).
+    PX_REFERER continua como override (ex.: PX_REFERER=https://outro/ ou none).
 
-Setup completo:
-  1. Sobe este arquivo normal (Render Web Service, python proxx.py)
-  2. Se o IP do host tomar 403 challenge: sobe um segundo serviço com a
-     imagem ghcr.io/flaresolverr/flaresolverr:latest (Render "Existing Image", free)
-  3. No serviço do proxx: Environment -> FLARE_URL = URL do FlareSolverr
-  4. GET /solve -> resolve e guarda o cookie; /px passa a funcionar pra todo mundo
+v3: headers de browser + Referer configurável.
+v2: integração com FlareSolverr (cf_clearance).
 
 Endpoints:
   GET /health            -> {ok, flare, cookies, idade}
-  GET /probe?u=<url>     -> diagnostico (status, content-type, cf-mitigated, cookies)
+  GET /probe?u=<url>     -> diagnostico (status, content-type, cf-mitigated)
   GET /px?u=<url>        -> stream do mp4 (Range passthrough, pronto pro <video>)
   GET /solve?u=<url>     -> força resolução via FlareSolverr (ou cloudscraper)
   GET /reset             -> limpa cookies guardados
 
-Allowlist: só proxieia hosts em PX_ALLOW (padrão: pixel-sus-4k-image.com)
-pra não virar proxy aberto e o app não levar ban.
+Allowlist: só proxieia hosts em PX_ALLOW (padrão: pixel-sus-4k-image.com).
 """
 import os
 import threading
@@ -39,6 +35,9 @@ ALLOW = {d.strip() for d in os.environ.get(
     "PX_ALLOW", "pixel-sus-4k-image.com").split(",") if d.strip()}
 
 FLARE = os.environ.get("FLARE_URL", "").rstrip("/")
+# Referer que vai pro CDN. PADRÃO = sushianimes.com.br (whitelist do pixel-sus).
+# Pra trocar: PX_REFERER=https://outro-site/ ; PX_REFERER=none = sem referer.
+PX_REFERER = os.environ.get("PX_REFERER", "https://sushianimes.com.br/").strip()
 
 _state = {"cookies": {}, "ua": UA, "ts": 0.0}
 _lock = threading.Lock()
@@ -46,7 +45,7 @@ _scrap = None
 
 
 def scraper():
-    """Sessão cloudscraper global (plano B sem FlareSolverr)."""
+    """Sessão cloudscraper global (fingerprint TLS de Chrome)."""
     global _scrap
     with _lock:
         if _scrap is None:
@@ -72,7 +71,7 @@ def is_challenge(r) -> bool:
 
 
 def flare_solve(u: str):
-    """Pede pro FlareSolverr abrir a URL num browser de verdade e devolver cf_clearance."""
+    """Pede pro FlareSolverr abrir a URL num browser e devolver cf_clearance."""
     if not FLARE:
         return False
     try:
@@ -97,8 +96,8 @@ def flare_solve(u: str):
 
 
 def session_get(u, range_val=None, stream=False, timeout=40):
-    """Request com os cookies resolvidos + UA compatível."""
-    s = requests.Session()
+    """Request com cloudscraper (TLS Chrome) + cookies + Referer sushianimes."""
+    s = scraper()   # cloudscraper em vez de requests puro
     with _lock:
         ua = _state["ua"] or UA
         cks = dict(_state["cookies"])
@@ -106,8 +105,22 @@ def session_get(u, range_val=None, stream=False, timeout=40):
         "User-Agent": ua,
         "Accept": "*/*",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        "Referer": "https://www.google.com/",
     })
+    if PX_REFERER and PX_REFERER.lower() != "none":
+        s.headers.update({
+            "Referer": PX_REFERER,
+            "Sec-Fetch-Dest": "video",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        })
+    else:
+        s.headers.update({
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        })
     for k, v in cks.items():
         s.cookies.set(k, v, domain="." + urlparse(u).hostname.split(".", 1)[-1])
     h = {}
@@ -118,7 +131,8 @@ def session_get(u, range_val=None, stream=False, timeout=40):
 
 @app.get("/")
 def root():
-    return jsonify(ok=True, svc="proxx", v=2, allow=sorted(ALLOW), flare=bool(FLARE))
+    return jsonify(ok=True, svc="proxx", v=4, allow=sorted(ALLOW),
+                   flare=bool(FLARE), referer=(PX_REFERER or "(sem)"))
 
 
 @app.get("/health")
@@ -156,7 +170,6 @@ def solve():
         return jsonify(ok=False, error="host fora da allowlist"), 403
     if flare_solve(u):
         return jsonify(ok=True, via="flaresolverr", cookies=len(_state["cookies"]))
-    # plano B: cloudscraper
     try:
         r = scraper().get(u, timeout=40)
         if not is_challenge(r):
@@ -189,12 +202,11 @@ def px():
         r = session_get(u, range_val=rg, stream=True)
         if is_challenge(r):
             r.close()
-            # auto-solve e uma segunda chance
             flare_solve(u)
             r = session_get(u, range_val=rg, stream=True)
             if is_challenge(r):
                 info = jsonify(ok=False, status=r.status_code,
-                               note="desafio cf ativo — chama /solve (precisa de FLARE_URL)",
+                               note="desafio cf ativo — chama /solve (precisa FLARE_URL)",
                                cfMitigated=r.headers.get("cf-mitigated"))
                 info.status_code = 502
                 r.close()
